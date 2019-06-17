@@ -4,6 +4,7 @@ const fs = require('fs');
 const vm = require('vm');
 const path = require('path');
 const Module = require('module');
+const http = require('http');
 
 const bodyParser = require('body-parser');
 const client = require('prom-client');
@@ -23,7 +24,7 @@ app.use(bodyParser.raw(bodParserOptions));
 app.use(bodyParser.json({ limit: `${bodySizeLimit}mb` }));
 app.use(bodyParser.urlencoded({ limit: `${bodySizeLimit}mb`, extended: true }));
 
-const modName = process.env.MOD_NAME;
+const modName = process.env.MOD_NAME.replace(/_/g, '/');
 const funcHandler = process.env.FUNC_HANDLER;
 const timeout = Number(process.env.FUNC_TIMEOUT || '180');
 const funcPort = Number(process.env.FUNC_PORT || '8080');
@@ -105,6 +106,22 @@ function modExecute(handler, req, res, end) {
     }
 }
 
+function modExecuteWithoutRequest(handler, end) {
+    let func = null;
+    switch (typeof handler) {
+        case 'function':
+            func = handler;
+            break;
+        case 'object':
+            if (handler) func = handler[funcHandler];
+            break;
+    }
+    if (func === null)
+        throw new Error(`Unable to load ${handler}`);
+
+    func(context)
+}
+
 function modFinalize(result, res, end) {
     if (!res.finished) switch(typeof result) {
         case 'string':
@@ -131,6 +148,30 @@ function handleError(err, res, label, end) {
 
 function funcLabel(req) {
     return modName + '-' + req.method;
+}
+
+
+if (funcHandler === 'init') {
+    const end = timeHistogram.labels(modName).startTimer();
+    callsCounter.labels(modName).inc();
+
+    const sandbox = Object.assign({}, global, {
+        __filename: modPath,
+        __dirname: modRootPath,
+        module: new Module(modPath, null),
+        require: (p) => {
+            if (p === 'kubeless')
+                return (handler) => modExecuteWithoutRequest(handler, end);
+            else if (libDeps.includes(p))
+                return require(path.join(libPath, p));
+            else if (p.indexOf('./') === 0)
+                return require(path.join(path.dirname(modPath), p));
+            else
+                return require(p);
+        },
+    });
+
+    script.runInNewContext(sandbox, { timeout : timeout * 1000 });
 }
 
 app.all('*', (req, res) => {
